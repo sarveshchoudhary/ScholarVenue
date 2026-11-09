@@ -14,7 +14,6 @@
 > Built as a research and coursework project by a four-member team at Vidyalankar Institute of Technology for Probabilistic Graphical Models and Recommendation Systems.
 
 ## Why ScholarVenue?
-
 Selecting a publication venue is a cold-start recommendation problem: early-career researchers often have no submission history, while publisher-specific finders only cover one catalogue. ScholarVenue combines paper content, venue metadata, subject classifications, and author preferences to produce an explainable shortlist instead of a black-box title match.
 
 ## What it does
@@ -31,7 +30,6 @@ Selecting a publication venue is a cold-start recommendation problem: early-care
 | **Similar venues** | Uses TF-IDF and cosine similarity to find related venue titles. |
 
 ## How the recommendation works
-
 1. **Build a paper profile** from extracted text, detected topics, and quality signals.
 2. **Map topics to ASJC subjects** such as Computer Science, Medicine, Engineering, Physics, and Social Sciences.
 3. **Score candidate venues** using subject match, venue quality, paper–venue fit, and publisher profile.
