@@ -6,10 +6,22 @@ const FormData = require("form-data");
 const recommendRoute = require("./routes/recommend");
 
 const app = express();
-const upload = multer();
+const PORT = Number(process.env.PORT || 3001);
+const PYTHON_API_URL = process.env.PYTHON_API_URL || "http://127.0.0.1:5000";
+const FRONTEND_ORIGINS = (process.env.FRONTEND_ORIGINS || "http://localhost:3000")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const upload = multer({
+  limits: { fileSize: Number(process.env.MAX_PDF_BYTES || 25 * 1024 * 1024) },
+});
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: FRONTEND_ORIGINS }));
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "gateway" });
+});
 
 app.post("/analyze", upload.single("file"), async (req, res) => {
   try {
@@ -22,7 +34,7 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
     formData.append("file", req.file.buffer, "file.pdf");
 
     const response = await axios.post(
-      "http://127.0.0.1:5000/predict",
+      `${PYTHON_API_URL}/predict`,
       formData,
       {
         headers: {
@@ -33,13 +45,16 @@ app.post("/analyze", upload.single("file"), async (req, res) => {
 
     res.json(response.data);
   } catch (error) {
-    console.error("Error:", error.message);
-    res.status(500).json({ error: error.message || "Error processing file" });
+    console.error("Analysis proxy error:", error.message);
+    const status = error.response?.status === 400 ? 400 : 502;
+    res.status(status).json({
+      error: status === 400 ? error.response.data?.error || "Invalid paper upload" : "Analysis service unavailable",
+    });
   }
 });
 
-app.post("/api/recommend", recommendRoute);
+app.post("/api/recommend", (req, res) => recommendRoute(req, res, PYTHON_API_URL));
 
-app.listen(3001, () => {
-  console.log("Server running on http://localhost:3001");
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });

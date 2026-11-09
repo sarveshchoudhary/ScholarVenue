@@ -38,7 +38,7 @@ function VenueRecommenderEnhanced({ paperText, paperScore, paperTopic }) {
 
     try {
       const response = await axios.post(
-        "http://localhost:5000/recommend",
+        "/api/recommend",
         {
           paper_text: paperText || paperDescription,
           paper_score: paperScore || 5.0,

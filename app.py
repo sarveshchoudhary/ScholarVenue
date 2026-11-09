@@ -5,6 +5,7 @@ import pandas as pd
 import fitz
 import os
 import re
+import logging
 from collections import Counter
 # Import enhanced recommender with ASJC-based scoring (v2 with proper dataset integration)
 try:
@@ -13,18 +14,27 @@ except ImportError:
     from recommender_enhanced import load_venue_database_enhanced, recommend_venues_enhanced
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-
-# Get the directory of the current file
 current_dir = os.path.dirname(os.path.abspath(__file__))
+MAX_PDF_BYTES = int(os.getenv("MAX_PDF_BYTES", str(25 * 1024 * 1024)))
+FRONTEND_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_PDF_BYTES
+CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGINS}})
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("scholarvenue")
 
 # Load model with error handling
 try:
     model_path = os.path.join(current_dir, "model.pkl")
-    model = pickle.load(open(model_path, "rb"))
-except Exception as e:
-    print(f"Error loading model: {e}")
+    with open(model_path, "rb") as model_file:
+        model = pickle.load(model_file)
+except (OSError, ValueError, pickle.UnpicklingError) as e:
+    logger.error("Model could not be loaded: %s", e)
     model = None
 
 # Load new venue dataset (ext_list_Jan_2026)
@@ -37,22 +47,22 @@ try:
     
     if os.path.exists(csv_path):
         dataset = pd.read_csv(csv_path)
-        print(f"[OK] Loaded new venue dataset: {len(dataset)} active venues")
+        logger.info("Loaded venue dataset: %s rows", len(dataset))
     else:
         # Keep existing behavior for backward compatibility
         csv_path = os.path.join(current_dir, "arxiv_clean.csv")
         dataset = pd.read_csv(csv_path)
         dataset = dataset.dropna().head(100)
-except Exception as e:
-    print(f"Error loading dataset: {e}")
+except (OSError, ValueError, pd.errors.ParserError) as e:
+    logger.error("Dataset could not be loaded: %s", e)
     dataset = pd.DataFrame()
 
 # Load venue database for recommendations
 try:
     venue_db = load_venue_database_enhanced()
-    print(f"[OK] Enhanced venue database loaded with {len(venue_db)} venues")
-except Exception as e:
-    print(f"Warning: Could not load venue database: {e}")
+    logger.info("Loaded enhanced venue database: %s venues", len(venue_db))
+except (OSError, ValueError, pd.errors.ParserError) as e:
+    logger.warning("Venue database could not be loaded: %s", e)
     venue_db = None
 
 # Load TF-IDF vectorizer for recommendation topic matching
@@ -73,10 +83,18 @@ DOMAIN_KEYWORDS_SIMPLE = {
 
 # Extract text
 def extract_text_from_pdf(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
-    text = ""
-    for page in doc:
-        text += page.get_text()
+    content = file.read()
+    if not content:
+        raise ValueError("The uploaded PDF is empty")
+    if len(content) > MAX_PDF_BYTES:
+        raise ValueError(f"PDF exceeds the {MAX_PDF_BYTES // (1024 * 1024)} MB limit")
+    try:
+        with fitz.open(stream=content, filetype="pdf") as doc:
+            text = "\n".join(page.get_text() for page in doc)
+    except (fitz.FileDataError, ValueError) as exc:
+        raise ValueError("The uploaded file is not a readable PDF") from exc
+    if not text.strip():
+        raise ValueError("No selectable text was found in the PDF")
     return text
 
 # Extract features
@@ -132,31 +150,42 @@ def get_domain_stats(text):
         domain_stats["total_venues"] = len(dataset)
         
         # Try to count OA venues
-        try:
-            domain_stats["oa_count"] = len(dataset[dataset.get("OA Status", pd.Series()).str.contains("OA", case=False, na=False)])
-        except:
-            domain_stats["oa_count"] = 0
+        oa_column = dataset.get("OA Status")
+        if oa_column is not None:
+            domain_stats["oa_count"] = int(oa_column.astype(str).str.contains("OA|open", case=False, na=False).sum())
         
         # Try to count Medline venues
-        try:
-            domain_stats["medline_count"] = len(dataset[dataset.get("Medline Coverage", pd.Series()).str.contains("Yes|Indexed", case=False, na=False)])
-        except:
-            domain_stats["medline_count"] = 0
+        medline_column = dataset.get("Medline Coverage")
+        if medline_column is not None:
+            domain_stats["medline_count"] = int(medline_column.astype(str).str.contains("Yes|Indexed", case=False, na=False).sum())
         
         # Try to count active venues
-        try:
-            domain_stats["active_count"] = len(dataset[dataset.get("Status", pd.Series()).str.contains("Active", case=False, na=False)])
-        except:
-            domain_stats["active_count"] = len(dataset)
+        status_column = dataset.get("Status")
+        domain_stats["active_count"] = (
+            int(status_column.astype(str).str.contains("Active", case=False, na=False).sum())
+            if status_column is not None else len(dataset)
+        )
         
         # Count publishers
-        try:
-            domain_stats["publishers_count"] = dataset.get("Publisher", pd.Series()).nunique()
-        except:
-            domain_stats["publishers_count"] = 0
-        
-        # For now, set matching_venues as domain percentage (this can be enhanced)
-        domain_stats["matching_venues"] = int(len(dataset) * 0.3)  # Estimate ~30% match to domain
+        publisher_column = dataset.get("Publisher")
+        if publisher_column is not None:
+            domain_stats["publishers_count"] = int(publisher_column.nunique())
+
+        domain_terms = DOMAIN_KEYWORDS_SIMPLE.get(detected_domain, [])
+        searchable_columns = [
+            column for column in dataset.columns
+            if column == "Source Title" or column.startswith(tuple(f"{code}\n" for code in (
+                "1100", "1200", "1300", "1400", "1500", "1600", "1700", "1800",
+                "1900", "2000", "2100", "2200", "2300", "2400", "2500", "2600",
+                "2700", "2800", "2900", "3000", "3100", "3200", "3300", "3400",
+                "3500", "3600"
+            )))
+        ]
+        if domain_terms and searchable_columns:
+            searchable = dataset[searchable_columns].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+            domain_stats["matching_venues"] = int(
+                searchable.apply(lambda value: any(term in value for term in domain_terms)).sum()
+            )
     
     return domain_stats
 
@@ -328,7 +357,11 @@ def generate_recommendations(text, features, score):
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
-        file = request.files["file"]
+        file = request.files.get("file")
+        if file is None or not file.filename:
+            return jsonify({"error": "A PDF file is required"}), 400
+        if not file.filename.lower().endswith(".pdf"):
+            return jsonify({"error": "Only PDF files are supported"}), 415
 
         text = extract_text_from_pdf(file)
 
@@ -343,8 +376,8 @@ def predict():
 
         # Check if model is loaded, use default score if not
         if model is None:
-            print("Warning: Model not loaded, using default scoring")
-            score = 6.5  # Default middle score
+            logger.warning("Model not loaded; returning an unavailable score")
+            return jsonify({"error": "Analysis model is unavailable"}), 503
         else:
             score = model.predict(features_df)[0]
 
@@ -400,13 +433,14 @@ def predict():
             "domain_stats": domain_stats
         })
     
-    except Exception as e:
-        print(f"Error in predict endpoint: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "error": f"Failed to analyze paper: {str(e)}"
-        }), 500
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except (fitz.FileDataError, KeyError) as e:
+        logger.warning("Invalid analysis request: %s", e)
+        return jsonify({"error": "The paper could not be analyzed"}), 400
+    except Exception:
+        logger.exception("Unexpected error in predict endpoint")
+        return jsonify({"error": "Unable to analyze the paper right now"}), 500
 
 
 @app.route("/recommend", methods=["POST"])
@@ -448,10 +482,14 @@ def recommend():
     
     try:
         # Parse request
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "A JSON request body is required"}), 400
         
         paper_text = data.get("paper_text", "")
         paper_score = float(data.get("paper_score", 5))
+        if not 0 <= paper_score <= 10:
+            return jsonify({"error": "paper_score must be between 0 and 10"}), 400
         paper_topic = data.get("paper_topic", "")
         
         # Build preferences dict with ENHANCED parameters
@@ -494,11 +532,9 @@ def recommend():
     
     except ValueError as e:
         return jsonify({"error": f"Invalid input: {str(e)}"}), 400
-    except Exception as e:
-        print(f"Recommend endpoint error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+    except Exception:
+        logger.exception("Unexpected error in recommend endpoint")
+        return jsonify({"error": "Unable to generate recommendations right now"}), 500
 
 
 @app.route("/health", methods=["GET"])
@@ -514,5 +550,16 @@ def health():
     })
 
 
+@app.route("/ready", methods=["GET"])
+def ready():
+    if model is None or venue_db is None or venue_db.empty:
+        return jsonify({"status": "not_ready"}), 503
+    return jsonify({"status": "ready"})
+
+
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    app.run(
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
+        host=os.getenv("FLASK_HOST", "127.0.0.1"),
+        port=int(os.getenv("FLASK_PORT", "5000")),
+    )

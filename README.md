@@ -114,6 +114,21 @@ npm start
 
 Open `http://localhost:3000`.
 
+### Production configuration
+
+The browser should communicate with the Express gateway, not the Flask service directly. Configure the services with environment variables before deployment:
+
+```powershell
+$env:FRONTEND_ORIGINS = "https://your-frontend.example.com"
+$env:PYTHON_API_URL = "http://127.0.0.1:5000"
+$env:MAX_PDF_BYTES = "26214400"
+$env:FLASK_DEBUG = "false"
+```
+
+The Flask API exposes `/ready` for readiness probes and `/health` for service diagnostics. Run Flask behind a production WSGI server such as Waitress or Gunicorn; do not expose `python app.py` directly to the internet. The frontend uses `/analyze` and `/api/recommend`, which are proxied by Express.
+
+The quality model is pinned to scikit-learn `1.6.1`, the version used when `model.pkl` was created. Retrain and version the model before changing this dependency.
+
 ### Service health check
 
 ```powershell
